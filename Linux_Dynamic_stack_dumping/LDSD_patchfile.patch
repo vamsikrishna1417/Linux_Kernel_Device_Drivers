@@ -1,0 +1,246 @@
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/dynamic_dump_stack/dynamic_dump_stack.c ./dynamic_dump_stack/dynamic_dump_stack.c
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/dynamic_dump_stack/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ ./dynamic_dump_stack/dynamic_dump_stack.c	2018-11-29 21:23:38.871905689 -0700
+@@ -0,0 +1,137 @@
++#include<linux/kernel.h>
++#include<linux/init.h>
++#include<linux/types.h>
++#include<linux/sched.h>
++#include<linux/syscalls.h>
++#include <linux/kallsyms.h>
++#include<linux/kprobes.h>
++#include<linux/slab.h>
++#include <asm/sections.h>
++
++typedef struct kprobe_t
++{
++  struct kprobe kp;
++  struct list_head	device_entry;
++  unsigned int uidumpid;
++  pid_t parent_pid;
++  pid_t self_pid;
++  unsigned int dumpmode;
++}kprobe_t;
++
++static unsigned int gdumpid = 0;
++static LIST_HEAD(kprobe_list);
++
++static int Pre_Handler (struct kprobe *p, struct pt_regs *regs)
++{
++  dump_stack();
++  printk("Inside Prehandler\n");
++  return 0;
++}
++
++static void Post_Handler (struct kprobe *p, struct pt_regs *regs,
++                          unsigned long flags)
++{
++  printk(KERN_INFO "Post_Handler: p->addr = 0x%p, ip = %lx,"
++      "flags = 0x%lx\n", p->addr, regs->ip, regs->flags);
++}
++
++static int handler_fault (struct kprobe *p, struct pt_regs *regs, int trapnr)
++{
++  printk ("fault_handler:p->addr=0x%p, eflags=0x%lx\n", p->addr, regs->sp);
++  return 0;
++}
++
++
++SYSCALL_DEFINE2(insdump, const char __user *, symbolname, dumpmode_t, mode)
++{
++  kprobe_t *p_kprobe_t;
++  int ret = 0;
++  /* Allocate data */
++  p_kprobe_t = kzalloc(sizeof(*p_kprobe_t), GFP_KERNEL);
++  if (!p_kprobe_t)
++    return -ENOMEM;
++
++  INIT_LIST_HEAD(&p_kprobe_t->device_entry);
++  list_add(&p_kprobe_t->device_entry, &kprobe_list);
++
++  p_kprobe_t->kp.pre_handler = Pre_Handler;
++  p_kprobe_t->kp.post_handler = Post_Handler;
++  p_kprobe_t->kp.fault_handler = handler_fault;
++  p_kprobe_t->kp.addr =
++    (kprobe_opcode_t *) kallsyms_lookup_name (symbolname) ;
++  if (p_kprobe_t->kp.addr == NULL)
++  {
++    printk
++      (" kallsyms_lookup_name could not find address for the specified symbol name \n");
++    return -EINVAL;
++  }
++  /* Testing whether the symbol name is in Text Section */
++  if ((((unsigned long)p_kprobe_t->kp.addr) >= (unsigned long)_sinittext && ((unsigned long)p_kprobe_t->kp.addr) <= (unsigned long)_einittext) )
++  {
++    printk
++      (" Symbol name is not in text section \n");
++    return -EINVAL;
++  }
++
++  /* registering the probe */
++  ret = register_kprobe (&p_kprobe_t->kp);
++  if (ret < 0)
++  {
++    printk (KERN_INFO "register_kprobe failed, returned %d\n", ret);
++    return ret;
++  }
++  else
++  {
++    gdumpid += 1;
++    p_kprobe_t->uidumpid = gdumpid;
++    /* calling system calls to store parent pid and child pid in the list */
++    p_kprobe_t->parent_pid = sys_getppid();
++    p_kprobe_t->self_pid = sys_getpid();
++    p_kprobe_t->dumpmode = mode;
++    printk (KERN_INFO "Registered the kprobe %p \n", &p_kprobe_t->kp);
++  }
++
++  return p_kprobe_t->uidumpid;
++}
++
++
++SYSCALL_DEFINE1(rmdump, unsigned int, dumpid)
++{
++  kprobe_t *p_kprobe_t;
++  struct list_head *pos, *q;
++  int operation_success = 0;
++  /* unregistering the existing probe */
++  if(dumpid == 0)
++  {
++    list_for_each_safe(pos, q, &kprobe_list) {
++      p_kprobe_t = list_entry(pos, struct kprobe_t, device_entry);
++      list_del(&p_kprobe_t->device_entry);
++      unregister_kprobe (&p_kprobe_t->kp);
++      kfree(p_kprobe_t);
++    }
++    printk (KERN_INFO "unregistered all kprobes \n");
++    operation_success = 1;
++    gdumpid = 0;
++  }
++  else
++  {
++    list_for_each_safe(pos, q, &kprobe_list) {
++      p_kprobe_t = list_entry(pos, struct kprobe_t, device_entry);
++      if(p_kprobe_t->uidumpid == dumpid)
++      {
++        list_del(&p_kprobe_t->device_entry);
++        unregister_kprobe (&p_kprobe_t->kp);
++        kfree(p_kprobe_t);
++        operation_success = 1;
++        printk (KERN_INFO "unregistered the kprobe with dumpid %d \n", dumpid);
++        break;
++      }
++    }
++  }
++  if(operation_success == 0)
++  {
++    printk (KERN_INFO "Something wrong with input to rmdump \n");
++    return -EINVAL;
++  }
++  return 0;
++}
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/dynamic_dump_stack/Kconfig ./dynamic_dump_stack/Kconfig
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/dynamic_dump_stack/Kconfig	1969-12-31 17:00:00.000000000 -0700
++++ ./dynamic_dump_stack/Kconfig	2018-11-29 20:09:33.447250450 -0700
+@@ -0,0 +1,9 @@
++
++config DYNAMIC_DUMP_STACK
++	bool "Compile the kernel with dynamic dump stack"
++	default y
++  help
++  If you say Y here the resulting kernel image will include
++  insertion and deletion of dynamic dump stacks.
++
++  If unsure, say N.
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/dynamic_dump_stack/Makefile ./dynamic_dump_stack/Makefile
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/dynamic_dump_stack/Makefile	1969-12-31 17:00:00.000000000 -0700
++++ ./dynamic_dump_stack/Makefile	2018-11-30 00:01:25.669427848 -0700
+@@ -0,0 +1,3 @@
++
++obj-$(CONFIG_DYNAMIC_DUMP_STACK) += dynamic_dump_stack.o
++
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/include/linux/syscalls.h kernel/include/linux/syscalls.h
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/include/linux/syscalls.h	2017-06-17 10:44:57.000000000 -0700
++++ kernel/include/linux/syscalls.h	2018-11-29 20:52:51.954556965 -0700
+@@ -882,4 +882,7 @@
+ 			const char __user *const __user *argv,
+ 			const char __user *const __user *envp, int flags);
+ 
++asmlinkage long sys_insdump(const char __user * symbolname, dumpmode_t mode);
++asmlinkage long sys_rmdump(unsigned int dumpid);
++
+ #endif
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/include/linux/types.h kernel/include/linux/types.h
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/include/linux/types.h	2017-06-17 10:44:57.000000000 -0700
++++ kernel/include/linux/types.h	2018-11-29 21:44:27.816450816 -0700
+@@ -89,6 +89,7 @@
+ typedef unsigned char		unchar;
+ typedef unsigned short		ushort;
+ typedef unsigned int		uint;
++typedef unsigned int		dumpmode_t;
+ typedef unsigned long		ulong;
+ 
+ #ifndef __BIT_TYPES_DEFINED__
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/arch/x86/syscalls/syscall_32.tbl kernel/arch/x86/syscalls/syscall_32.tbl
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel/arch/x86/syscalls/syscall_32.tbl	2018-11-29 20:52:44.226499043 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump   sys_insdump
++360	i386	rmdump   sys_rmdump
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/kernel/sys_ni.c kernel/kernel/sys_ni.c
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/kernel/sys_ni.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel/kernel/sys_ni.c	2018-11-29 20:52:49.242536631 -0700
+@@ -229,3 +229,5 @@
+ 
+ /* execveat */
+ cond_syscall(sys_execveat);
++cond_syscall(sys_insdump);
++cond_syscall(sys_rmdump);
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/include/uapi/asm-generic/unistd.h kernel/include/uapi/asm-generic/unistd.h
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/include/uapi/asm-generic/unistd.h	2017-06-17 10:44:58.000000000 -0700
++++ kernel/include/uapi/asm-generic/unistd.h	2018-11-29 21:53:17.452192561 -0700
+@@ -709,9 +709,13 @@
+ __SYSCALL(__NR_bpf, sys_bpf)
+ #define __NR_execveat 281
+ __SC_COMP(__NR_execveat, sys_execveat, compat_sys_execveat)
++#define __NR_insmod 282
++__SYSCALL(__NR_insmod, sys_insdump)
++#define __NR_rmmod 283
++__SYSCALL(__NR_insmod, sys_rmdump)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 282
++#define __NR_syscalls 284
+ 
+ /*
+  * All syscalls below here should go away really,
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/Makefile kernel/Makefile
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/Makefile	2017-06-17 10:44:24.000000000 -0700
++++ kernel/Makefile	2018-11-29 22:35:09.800952957 -0700
+@@ -879,7 +879,7 @@
+ 
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ mm/ fs/ ipc/ security/ crypto/ block/ dynamic_dump_stack/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, $(init-y) $(init-m) \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff -urN -x '*.o' /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/lib/Kconfig.debug kernel/lib/Kconfig.debug
+--- /opt/iot-devkit/1.7.2/sysroots/i586-poky-linux/usr/src/kernel/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel/lib/Kconfig.debug	2018-11-29 21:51:07.119584427 -0700
+@@ -115,6 +115,10 @@
+ 
+ endmenu # "printk and dmesg options"
+ 
++menu "dynamic dump_stack"
++source "dynamic_dump_stack/Kconfig"
++endmenu #
++
+ menu "Compile-time checks and compiler options"
+ 
+ config DEBUG_INFO
+
